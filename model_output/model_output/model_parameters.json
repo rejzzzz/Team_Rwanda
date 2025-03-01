@@ -1,0 +1,26 @@
+{
+    "layer_type": "LSTM",
+    "bidirectional": true,
+    "depth": 2,
+    "hidden_neurons": 64,
+    "kernel_initializer": "glorot_uniform",
+    "recurrent_initializer": "orthogonal",
+    "dropout": 0.2,
+    "recurrent_dropout": 0.2,
+    "r_l1_reg": 0.0,
+    "r_l2_reg": 0.001,
+    "b_l1_reg": 0.0,
+    "b_l2_reg": 0.001,
+    "optimiser": "adam",
+    "learning_rate": 0.001,
+    "loss": "categorical_crossentropy",
+    "activation": "softmax",
+    "epochs": 20,
+    "sequence_length": 31,
+    "batch_size": [
+        64
+    ],
+    "description": [
+        "C"
+    ]
+}
