@@ -1,5 +1,7 @@
 # AI-Powered Malware Detection App
 
+![alt text](https://github.com/rejzzzz/Team_Rwanda/image.jpg?raw=true)
+
 ## Overview
 
 This desktop cybersecurity application analyzes running processes and predicts potential **malware threats** using a **local machine learning model**. It continuously monitors system metrics like **CPU usage, memory consumption, network activity, and total running processes** to detect suspicious behavior.
