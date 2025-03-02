@@ -1,6 +1,7 @@
 # AI-Powered Malware Detection App
 
-![alt text](https://github.com/rejzzzz/Team_Rwanda/main/image.png)
+![alt text](https://raw.githubusercontent.com/rejzzzz/Team_Rwanda/main/image.png)
+
 
 ## Overview
 
