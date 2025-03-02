@@ -2,139 +2,182 @@ import sys
 import os
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import psutil
 import numpy as np
+import requests
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar, 
                              QSlider, QCheckBox, QComboBox, QSystemTrayIcon, QMenu, QAction, QMessageBox,
                              QFileDialog, QLineEdit, QDateEdit, QSpinBox, QGroupBox)
-from tensorflow import keras
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QDate
 from PyQt5.QtGui import QIcon, QColor, QFont, QPainter, QPen, QPixmap
 from PyQt5.QtChart import QChart, QChartView, QLineSeries, QValueAxis
 
+# Constants for malware detection
+CPU_THRESHOLD = 70.0  # Percentage of CPU usage (combined user and system)
+MEMORY_THRESHOLD = 2_000_000_000  # Memory usage in bytes (about 2GB)
 
+# AWS Lambda API endpoint (replace with your actual endpoint)
+LAMBDA_API_ENDPOINT = "https://your-aws-lambda-api-endpoint.amazonaws.com/predict"
 
-# Load local model at startup
-LOCAL_MODEL_PATH = "final_model.keras"
-try:
-    local_model = keras.models.load_model(LOCAL_MODEL_PATH)
-    print("Local model loaded successfully!")
-except Exception as e:
-    local_model = None
-    print(f"Failed to load local model: {e}")
-
-# AWS Lambda API endpoint (replace with actual URL)
-threat_alert_val =0
-# Malware detection thresholds
-CPU_THRESHOLD = 70.0  # CPU usage percentage
-MEMORY_THRESHOLD = 2_000_000_000  # Memory usage in bytes (2GB)
-
-def predict_with_local_model(data):
-    """Runs malware prediction using the local TensorFlow model."""
-    if local_model is None:
-        print("No local model available. Returning default score.")
-        return 50  # Neutral risk score
-
-    try:
-        # Extract features & ensure correct shape
-        input_vector = np.array([
-            data['vector'], data['memory'], data['tx_packets'],
-            data['rx_bytes'], data['swap'], data['rx_packets'],
-            data['cpu_sys'], data['total_pro'], data['cpu_user'],
-            data['max_pid'], data['tx_bytes'], data['malware']
-        ], dtype=np.float32)
-
-        # Fix shape: Reshape to (1, 10, 12)
-        input_vector = np.tile(input_vector, (10, 1))  # Repeat 10 times
-        input_vector = np.expand_dims(input_vector, axis=0)  # Add batch dimension (1, 10, 12)
-
-        # Get prediction
-        prediction = local_model.predict(input_vector)
-
-        # Convert probability to risk score (0-100)
-        risk_score = int(prediction[0][0] * 100)
-
-        global threat_alert_val
-        threat_alert_val = risk_score
-
-        return risk_score
-    except Exception as e:
-        print(f"⚠️ Error in local model prediction: {e}")
-        return 50  # Safe fallback score
-
-def predict_risk_score(process_data):
+def local_risk_assessment(process_data):
+    """
+    Local fallback method to assess risk without requiring API calls
+    
+    Args:
+        process_data: Process information from psutil
+        
+    Returns:
+        int: Risk score from 0-100 based on local metrics only
+    """
     try:
         pid = process_data['pid']
         process = psutil.Process(pid)
-
+        
         with process.oneshot():
-            # CPU usage metrics
-            cpu_user = process.cpu_times().user if hasattr(process.cpu_times(), 'user') else 0.0
-            cpu_sys = process.cpu_times().system if hasattr(process.cpu_times(), 'system') else 0.0
-            cpu_percent = process.cpu_percent(interval=0.1)  # Get CPU usage percentage
+            # Get key metrics
+            cpu_percent = process.cpu_percent()
+            memory = process.memory_info().rss
             
-            # Memory usage metrics
-            memory = process.memory_info().rss if hasattr(process, 'memory_info') else 0  # In bytes
-            memory_mb = memory / 1_000_000  # Convert to MB
+            # Simple threshold-based scoring
+            risk_score = 0
             
-            # System-wide metrics (network, swap, total processes)
-            net_io = psutil.net_io_counters()
-            swap = psutil.swap_memory().used
-            total_processes = len(psutil.pids())
-            max_pid = max(psutil.pids()) if psutil.pids() else 0
+            # CPU usage component (up to 40 points)
+            if cpu_percent > CPU_THRESHOLD:
+                risk_score += min(40, int(cpu_percent / 2))
+            else:
+                risk_score += int((cpu_percent / CPU_THRESHOLD) * 20)
+                
+            # Memory usage component (up to 40 points)
+            mem_factor = memory / MEMORY_THRESHOLD
+            if mem_factor > 1:
+                risk_score += min(40, int(40 * mem_factor))
+            else:
+                risk_score += int(mem_factor * 20)
+                
+            # Process name heuristics (up to 20 points)
+            suspicious_names = ["miner", "crypto", "hidden", "backdoor", "exploit"]
+            proc_name = process_data['name'].lower()
+            if any(s in proc_name for s in suspicious_names):
+                risk_score += 20
+                
+            # Cap the score at 100
+            return min(100, risk_score)
+            
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return 0
+    except Exception as e:
+        print(f"Error in local_rsfisk_assessment: {str(e)}")
+        return 0
 
-            # Per-process network I/O (if accessible)
+def predict_risk_score(process_data):
+    """
+    Collect system metrics and predict malware risk score using AWS Lambda API
+    with fallback to local assessment if API is unavailable
+    
+    Args:
+        process_data: Process information from psutil
+        
+    Returns:
+        int: Risk score from 0-100 based on model prediction
+    """
+    try:
+        pid = process_data['pid']
+        process = psutil.Process(pid)
+        
+        # Get detailed process information
+        with process.oneshot():
+            # CPU usage (user + system)
+            cpu_user = process.cpu_times().user
+            cpu_sys = process.cpu_times().system
+            cpu_percent = process.cpu_percent()
+            
+            # Memory usage
+            memory = process.memory_info().rss
+            
+            # Network I/O counters (might be None for some processes)
             try:
                 io_counters = process.io_counters()
-                tx_bytes = io_counters.bytes_sent
-                rx_bytes = io_counters.bytes_recv
+                tx_bytes = io_counters.write_bytes
+                rx_bytes = io_counters.read_bytes
                 tx_packets = io_counters.write_count
                 rx_packets = io_counters.read_count
             except (psutil.AccessDenied, AttributeError):
-                tx_bytes, rx_bytes, tx_packets, rx_packets = 0, 0, 0, 0
-
-            # Malware indicator (default to non-malicious)
-            is_malware = 0  
+                tx_bytes = 0
+                rx_bytes = 0
+                tx_packets = 0
+                rx_packets = 0
+            
+            # System-wide information
+            swap = psutil.swap_memory().used
+            total_proc = len(psutil.pids())
+            max_pid = max(psutil.pids())
+            
+            # Vector (can be any combination of metrics for your model)
+            vector = np.mean([cpu_percent, memory/1_000_000_000])
+            
+            # Check for malware based on thresholds
+            is_malware = 0
             reasons = []
-
             if cpu_percent > CPU_THRESHOLD:
-                reasons.append(f"High CPU: {cpu_percent:.2f}%")
+                reasons.append(f"High CPU usage: {cpu_percent:.2f}% (threshold: {CPU_THRESHOLD}%)")
             if memory > MEMORY_THRESHOLD:
-                reasons.append(f"High Memory: {memory_mb:.2f}MB")
-
-            # Prepare data for ML model (ensuring correct feature structure)
-            process_dict = {
-                'vector': pid,  # PID as unique identifier
-                'memory': memory,
-                'tx_packets': tx_packets,
-                'rx_bytes': rx_bytes,
-                'swap': swap,
-                'rx_packets': rx_packets,
-                'cpu_sys': cpu_sys,
-                'total_pro': total_processes,
-                'cpu_user': cpu_user,
-                'max_pid': max_pid,
-                'tx_bytes': net_io.bytes_sent,  # Use system-level data
-                'malware': is_malware  # Default to non-malware
+                reasons.append(f"High memory usage: {memory/1_000_000:.2f}MB (threshold: {MEMORY_THRESHOLD/1_000_000:.2f}MB)")
+            if reasons:
+                is_malware = 1
+            
+            # Prepare the data according to required format
+            data = {
+                'vector': float(vector),
+                'memory': int(memory),
+                'tx_packets': int(tx_packets),
+                'rx_bytes': int(rx_bytes),
+                'swap': int(swap),
+                'rx_packets': int(rx_packets),
+                'cpu_sys': float(cpu_sys),
+                'total_pro': int(total_proc),
+                'cpu_user': float(cpu_user),
+                'max_pid': int(max_pid),
+                'tx_bytes': int(tx_bytes),
+                'malware': is_malware
             }
-
-            # Debug: Print input data
-            print("Input data to model:", process_dict)
-
-            # Predict risk score using local ML model
-            threat_activity_val = predict_with_local_model(process_dict)
-            return threat_activity_val
-
+            
+            # Call AWS Lambda API with timeout to prevent blocking
+            try:
+                # Use requests with a timeout to prevent blocking
+                response = requests.post(LAMBDA_API_ENDPOINT, json=data, timeout=3)
+                if response.status_code == 200:
+                    result = response.json()
+                    
+                    # Extract prediction results
+                    predicted_class = result.get('predicted_class', 0)
+                    probabilities = result.get('probabilities', {})
+                    malware_probability = probabilities.get('Class 1', 0)
+                    
+                    # Convert probability to risk score (0-100)
+                    risk_score = int(malware_probability * 100)
+                    
+                    # If our thresholds already identified malware, ensure high risk score
+                    if is_malware == 1:
+                        risk_score = max(risk_score, 85)
+                    
+                    return risk_score
+                else:
+                    # API call failed, use local assessment instead
+                    return local_risk_assessment(process_data)
+            except (requests.RequestException, TimeoutError, ConnectionError) as e:
+                print(f"API connection error: {str(e)}")
+                # Use the local risk assessment as fallback
+                return local_risk_assessment(process_data)
+    
     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        return 0  # Process not available
+        # Process terminated or can't access it
+        return 0
     except Exception as e:
-        print(f"Error in predict_risk_score: {e}")
-        return 0  # Safe fallback
-
-
+        print(f"Error in predict_risk_score: {str(e)}")
+        return 0
 
 class ProcessMonitorThread(QThread):
     update_signal = pyqtSignal(list)
@@ -210,42 +253,103 @@ class ProcessMonitorThread(QThread):
         self.running = False
         self.wait()
 
+
 class SystemMetricsThread(QThread):
     update_signal = pyqtSignal(dict)
+    connection_status_signal = pyqtSignal(bool)
     
     def __init__(self):
         super().__init__()
         self.running = True
+        self.api_available = True
+        self.last_api_check = 0
+        
+    def check_api_connection(self):
+        """Check if the AWS Lambda API is available"""
+        current_time = time.time()
+        # Only check connection every 30 seconds to reduce overhead
+        if current_time - self.last_api_check < 30:
+            return self.api_available
+            
+        try:
+            # Simple HEAD request to check connectivity
+            response = requests.head(LAMBDA_API_ENDPOINT, timeout=2)
+            self.api_available = response.status_code < 400
+        except:
+            self.api_available = False
+            
+        self.last_api_check = current_time
+        self.connection_status_signal.emit(self.api_available)
+        return self.api_available
         
     def run(self):
         while self.running:
-            # Get system-wide metrics
-            cpu_percent = psutil.cpu_percent()
-            memory = psutil.virtual_memory()
-            memory_percent = memory.percent
-            
-            # Get network I/O stats
-            net_io = psutil.net_io_counters()
-            net_sent = net_io.bytes_sent
-            net_recv = net_io.bytes_recv
-            
-            # Generate a synthetic threat activity level (replace with real data)
-            threat_activity = threat_alert_val
-            
-            metrics = {
-                'cpu_percent': cpu_percent,
-                'memory_percent': memory_percent,
-                'net_sent': net_sent,
-                'net_recv': net_recv,
-                'threat_activity': threat_activity
-            }
-            
-            self.update_signal.emit(metrics)
-            time.sleep(1)
+            try:
+                # Get system-wide metrics (these don't depend on the API)
+                cpu_percent = psutil.cpu_percent()
+                memory = psutil.virtual_memory()
+                memory_percent = memory.percent
+                
+                # Get network I/O stats
+                net_io = psutil.net_io_counters()
+                net_sent = net_io.bytes_sent
+                net_recv = net_io.bytes_recv
+                
+                # Check API connection status in a non-blocking way
+                api_status = self.check_api_connection()
+                
+                # Calculate threat activity
+                # This is decoupled from API calls to avoid blocking
+                high_risk_count = 0
+                total_processes = 0
+                
+                # Sample only a subset of processes to avoid overloading
+                sample_size = 10
+                sampled_processes = random.sample(psutil.pids(), min(sample_size, len(psutil.pids())))
+                
+                for pid in sampled_processes:
+                    try:
+                        process = psutil.Process(pid)
+                        process_info = process.as_dict(attrs=['pid', 'name'])
+                        
+                        # Use local assessment if API is down
+                        if not api_status:
+                            risk_score = local_risk_assessment(process_info)
+                        else:
+                            risk_score = predict_risk_score(process_info)
+                            
+                        if risk_score > 80:
+                            high_risk_count += 1
+                        total_processes += 1
+                    except:
+                        continue
+                
+                # Calculate threat activity as percentage (with minimum denominator of 1)
+                threat_activity = int((high_risk_count / max(1, total_processes)) * 100)
+                
+                metrics = {
+                    'cpu_percent': cpu_percent,
+                    'memory_percent': memory_percent,
+                    'net_sent': net_sent,
+                    'net_recv': net_recv,
+                    'threat_activity': threat_activity,
+                    'api_available': api_status
+                }
+                
+                self.update_signal.emit(metrics)
+                
+                # Sleep to reduce CPU usage
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"Error in metrics thread: {str(e)}")
+                time.sleep(1)
     
     def stop(self):
         self.running = False
         self.wait()
+
+
 
 class ThreatAlert(QWidget):
     def __init__(self, threat_info, parent=None):
@@ -256,53 +360,53 @@ class ThreatAlert(QWidget):
         self.setMinimumWidth(400)
         self.setStyleSheet("background-color: white; border: 1px solid #ddd;")
         self.init_ui()
-       
+        
     def init_ui(self):
         layout = QVBoxLayout()
-       
+        
         # Header
-        header = QLabel("Threat Alert")
+        header = QLabel("⚠️ Threat Alert")
         header.setStyleSheet("font-size: 16pt; font-weight: bold; color: red;")
         layout.addWidget(header)
-       
+        
         # Threat details
         details_layout = QVBoxLayout()
         details_layout.addWidget(QLabel(f"<b>Process:</b> {self.threat_info['name']} (PID: {self.threat_info['pid']})"))
         details_layout.addWidget(QLabel(f"<b>Risk Score:</b> {self.threat_info['risk_score']}"))
         details_layout.addWidget(QLabel(f"<b>Detected at:</b> {self.threat_info['timestamp']}"))
         details_layout.addWidget(QLabel("<b>Recommendation:</b> Terminate process immediately"))
-       
+        
         details_group = QGroupBox("Threat Details")
         details_group.setLayout(details_layout)
         layout.addWidget(details_group)
-       
+        
         # Action buttons
         button_layout = QHBoxLayout()
-       
+        
         terminate_btn = QPushButton("Terminate")
         terminate_btn.setStyleSheet("background-color: #d9534f; color: white; padding: 8px;")
         terminate_btn.clicked.connect(self.terminate_process)
-       
+        
         quarantine_btn = QPushButton("Quarantine")
         quarantine_btn.setStyleSheet("background-color: #f0ad4e; color: white; padding: 8px;")
         quarantine_btn.clicked.connect(self.quarantine_process)
-       
+        
         ignore_btn = QPushButton("Ignore")
         ignore_btn.setStyleSheet("background-color: #5bc0de; color: white; padding: 8px;")
         ignore_btn.clicked.connect(self.ignore_process)
-       
+        
         whitelist_btn = QPushButton("Whitelist")
         whitelist_btn.setStyleSheet("background-color: #5cb85c; color: white; padding: 8px;")
         whitelist_btn.clicked.connect(self.whitelist_process)
-       
+        
         button_layout.addWidget(terminate_btn)
         button_layout.addWidget(quarantine_btn)
         button_layout.addWidget(ignore_btn)
         button_layout.addWidget(whitelist_btn)
-       
+        
         layout.addLayout(button_layout)
         self.setLayout(layout)
-   
+    
     def terminate_process(self):
         try:
             p = psutil.Process(self.threat_info['pid'])
@@ -311,109 +415,19 @@ class ThreatAlert(QWidget):
         except:
             QMessageBox.warning(self, "Error", f"Failed to terminate process {self.threat_info['name']}.")
         self.close()
-   
+    
     def quarantine_process(self):
         # In a real app, this would involve more complex logic
         QMessageBox.information(self, "Quarantine", f"Process {self.threat_info['name']} has been quarantined.")
         self.close()
-   
+    
     def ignore_process(self):
         self.close()
-   
+    
     def whitelist_process(self):
         # Add to whitelist (in a real app, this would be saved to a file)
         QMessageBox.information(self, "Whitelist", f"Process {self.threat_info['name']} has been added to whitelist.")
         self.close()
-
-
-class SecurityMonitor: 
-    def __init__(self):
-        # Initialize your UI components
-        self.last_threat = QLabel("Last Threat: None")
-        self.tray_icon = QSystemTrayIcon()
-        # Other initialization code...
-    
-    def process_ml_result(self, result, process_info):
-        # Extract the prediction and probabilities
-        predicted_class = result["predicted_class"]
-        probabilities = result["probabilities"]
-        malware_probability = probabilities.get("Class 1", 0)
-        
-        # Format timestamp
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Log the scan regardless of result
-        self.add_log_entry(
-            current_time,
-            process_info['name'],
-            process_info['pid'],
-            f"{malware_probability:.2%}",
-            "Malware" if predicted_class == 1 else "Safe"
-        )
-        
-        # Only show threat alert if predicted as malware (Class 1)
-        if predicted_class == 1:
-            # Create threat info
-            threat_info = {
-                'name': process_info['name'],
-                'pid': process_info['pid'],
-                'risk_score': f"{malware_probability:.2%}",
-                'timestamp': current_time
-            }
-            
-            # Show the threat alert
-            self.show_threat_alert(threat_info)
-    
-    def show_threat_alert(self, threat_info):
-        # Update last threat detected
-        self.last_threat.setText(f"Last Threat: {threat_info['name']} at {threat_info['timestamp']}")
-       
-        # Add to logs
-        self.add_log_entry(
-            threat_info['timestamp'],
-            threat_info['name'],
-            threat_info['pid'],
-            threat_info['risk_score'],
-            "Detected"
-        )
-       
-        # Show alert dialog
-        self.alert_dialog = ThreatAlert(threat_info)
-        self.alert_dialog.show()
-       
-        # Show tray notification
-        self.tray_icon.showMessage(
-            "Threat Detected",
-            f"High risk process detected: {threat_info['name']} (Score: {threat_info['risk_score']})",
-            QSystemTrayIcon.Critical,
-            5000
-        )
-    
-    def add_log_entry(self, timestamp, process_name, process_id, risk_score, status):
-        # Add entry to your log widget/database
-        # Implementation depends on how you're storing logs
-        pass
-
-    def scan_process(self, process_info):
-        # This would be the method that triggers your ML model
-        # and gets the result back
-        
-        # Example of calling ML model (simulated)
-        result = self.run_ml_model(process_info)
-        
-        # Process the result
-        self.process_ml_result(result, process_info)
-    
-    def run_ml_model(self, process_info):
-        # This would be your actual ML model integration
-        # For now, just returning a mock result
-        return {
-            "predicted_class": 0,  # 0 = safe, 1 = malware
-            "probabilities": {
-                "Class 0": 0.779741644859314,
-                "Class 1": 0.22025835514068604
-            }
-        }
 
 class LogEntry:
     def __init__(self, timestamp, process_name, pid, risk_score, action_taken):
@@ -431,8 +445,6 @@ class LogEntry:
             'risk_score': self.risk_score,
             'action_taken': self.action_taken
         }
-
-
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -522,6 +534,14 @@ class MainWindow(QMainWindow):
         self.ram_chart.axes(Qt.Horizontal)[0].setRange(0, 60)
         self.ram_chart.axes(Qt.Vertical)[0].setRange(0, 100)
         self.ram_chart_view = QChartView(self.ram_chart)
+
+        def update_connection_status(self, connected):
+            if connected:
+                self.protection_status.setText("Protection: Active (Online)")
+                self.protection_status.setStyleSheet("color: green; font-weight: bold;")
+            else:
+                self.protection_status.setText("Protection: Active (Offline Mode)")
+                self.protection_status.setStyleSheet("color: orange; font-weight: bold;")
         
         # Threat Activity chart
         self.threat_chart = QChart()
@@ -725,7 +745,7 @@ class MainWindow(QMainWindow):
         QApplication.quit()
     
     def start_monitoring(self):
-        # Start process monitoring thread
+    # Start process monitoring thread
         self.process_thread = ProcessMonitorThread()
         self.process_thread.update_signal.connect(self.update_process_list)
         self.process_thread.alert_signal.connect(self.show_threat_alert)
@@ -734,6 +754,7 @@ class MainWindow(QMainWindow):
         # Start system metrics thread
         self.metrics_thread = SystemMetricsThread()
         self.metrics_thread.update_signal.connect(self.update_metrics)
+        self.metrics_thread.connection_status_signal.connect(self.update_connection_status)
         self.metrics_thread.start()
     
     def update_process_list(self, process_list):
@@ -799,6 +820,17 @@ class MainWindow(QMainWindow):
             self.cpu_series.append(i, cpu)
             self.ram_series.append(i, ram)
             self.threat_series.append(i, threat)
+        
+        # Update connection status
+        self.update_connection_status(metrics['api_available'])
+
+    def update_connection_status(self, connected):
+        if connected:
+            self.protection_status.setText("Protection: Active (Online)")
+            self.protection_status.setStyleSheet("color: green; font-weight: bold;")
+        else:
+            self.protection_status.setText("Protection: Active (Offline Mode)")
+            self.protection_status.setStyleSheet("color: orange; font-weight: bold;")
     
     def show_threat_alert(self, threat_info):
         # Update last threat detected
